@@ -4,6 +4,8 @@
 # Copyright (c) 2015-2023 Florent Kermarrec <florent@enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
+from operator import xor
+
 from litex.gen import *
 from litex.gen.genlib.misc import WaitTimer
 
@@ -154,6 +156,90 @@ class LiteEthARPRX(LiteXModule):
         )
 
 # ARP Table ----------------------------------------------------------------------------------------
+class LiteEthARPHashTable(LiteXModule):
+    def __init__(self, clk_freq):
+        entries = 16
+
+        operation_done = Signal(reset_less=True)
+        operation_ip = Signal(32, reset_less=True)
+
+        lookup_request = Signal()
+        lookup_found = Signal(reset_less=True)
+        lookup_mac = Signal(48, reset_less=True)
+
+        insert_request = Signal()
+        insert_mac = Signal(48, reset_less=True)
+
+        # TODO: We xor all nibbles together of the IP to obtain the hash
+        #       It's probably better to to a proper hashing using some kind of LFSR
+        #       in the future
+        lookup_ptr = Signal(4, reset_less=True)
+        self.sync += [
+            lookup_ptr[0].eq(xor(xor(operation_ip[0], operation_ip[4]), xor(operation_ip[8], operation_ip[12]))),
+            lookup_ptr[1].eq(xor(xor(operation_ip[1], operation_ip[5]), xor(operation_ip[9], operation_ip[13]))),
+            lookup_ptr[2].eq(xor(xor(operation_ip[2], operation_ip[6]), xor(operation_ip[10], operation_ip[14]))),
+            lookup_ptr[3].eq(xor(xor(operation_ip[3], operation_ip[7]), xor(operation_ip[11], operation_ip[15]))),
+        ]
+
+        # Hold 2 bit valid counter + IP + mac address back to back
+        table_mem = Memory(2 + 32 + 48, entries)
+        table_port = table_mem.get_port(write_capable=True)
+        self.specials += table_mem, table_port
+        init_expiry = Constant(3, bits_sign=(2, False))
+
+        # Every second go through an entry in the table and decrement valid counter
+        # Since valid counter has 2 bits it takes 3 decrements to reach 0.
+        # Every entry is hit every 16 seconds. So an entry is valid for 48 seconds
+        expiry_timer = WaitTimer(clk_freq)
+        self.submodules += expiry_timer
+
+        expiry_ptr = Signal(bits_for(entries), reset_less = True)
+
+        self.fsm = fsm = FSM(reset_state="IDLE")
+        fsm.act("IDLE",
+            lookup_mac.eq(table_port.dat_r[34:82]),
+            NextValue(operation_done, 0),
+            NextValue(expiry_timer.wait, 1),
+            If(expiry_timer.done,
+                table_port.adr.eq(expiry_ptr),
+                NextState("DECREMENT_COUNTER")
+            )
+            .Elif(lookup_request,
+                NextState("DO_LOOKUP")
+            )
+            .Elif(insert_request,
+                NextState("DO_INSERT")
+            )
+        )
+
+        fsm.act("DECREMENT_COUNTER",
+            NextValue(expiry_timer.wait, 0),
+            table_port.adr.eq(expiry_ptr),
+            If(table_port.dat_r[0:2] != 0,
+                table_port.we.eq(1),
+                table_port.dat_w.eq(Cat(table_port.dat_r[0:2] - 1, table_port.dat_r[3:]))
+            ),
+            NextValue(expiry_ptr, expiry_ptr + 1),
+            NextState("IDLE")
+        )
+
+        fsm.act("DO_LOOKUP",
+            table_port.adr.eq(lookup_ptr),
+            NextState("TEST_IP")
+        )
+        fsm.act("TEST_IP",
+            table_port.adr.eq(lookup_ptr),
+            NextValue(lookup_found, (table_port.dat_r[0:2] != 0) & (table_port.dat_r[2:34] == operation_ip)),
+            NextValue(operation_done, 1),
+            NextState("IDLE")
+        )
+
+        fsm.act("DO_INSERT",
+            table_port.we.eq(1),
+            table_port.adr.eq(lookup_ptr),
+            table_port.dat_w.eq(Cat(init_expiry, operation_ip, insert_mac)),
+            NextValue(operation_done, 1),
+        )
 
 class LiteEthARPTable(LiteXModule):
     def __init__(self, clk_freq, max_requests=8):
@@ -176,14 +262,18 @@ class LiteEthARPTable(LiteXModule):
                 request_pending.eq(1)
             )
 
-        request_ip_address        = Signal(32, reset_less=True)
-        request_ip_address_reset  = Signal()
-        request_ip_address_update = Signal()
+        request_ip_address = Signal(32, reset_less=True)
         self.sync += \
-            If(request_ip_address_reset,
-                request_ip_address.eq(0)
-            ).Elif(request_ip_address_update,
+            If(request.valid,
                 request_ip_address.eq(request.ip_address)
+            )
+
+        rx_ip_address = Signal(32, reset_less=True)
+        rx_mac_address = Signal(48, reset_less=True)
+        self.sync += \
+            If(sink.valid,
+                rx_ip_address.eq(sink.ip_address),
+                rx_mac_address.eq(sink.mac_address)
             )
 
         request_timer = WaitTimer(clk_freq//10)
@@ -199,15 +289,9 @@ class LiteEthARPTable(LiteXModule):
             )
         self.comb += request_timer.wait.eq(request_pending & ~request_counter_ce)
 
-        # Note: Store only 1 IP/MAC couple, can be improved with a real
-        # table in the future to improve performance when packets are
-        # targeting multiple destinations.
-        update = Signal()
-        cached_valid       = Signal()
-        cached_ip_address  = Signal(32, reset_less=True)
-        cached_mac_address = Signal(48, reset_less=True)
-        cached_timer       = WaitTimer(clk_freq*10)
-        self.submodules += cached_timer
+        # hash table
+        hash_table = LiteEthARPHashTable(clk_freq)
+        self.submodules += hash_table
 
         self.fsm = fsm = FSM(reset_state="IDLE")
         fsm.act("IDLE",
@@ -226,29 +310,35 @@ class LiteEthARPTable(LiteXModule):
         fsm.act("SEND_REPLY",
             source.valid.eq(1),
             source.reply.eq(1),
-            source.ip_address.eq(sink.ip_address),
-            source.mac_address.eq(sink.mac_address),
+            source.ip_address.eq(rx_ip_address),
+            source.mac_address.eq(rx_mac_address),
             If(source.ready,
                 NextState("IDLE")
             )
         )
         fsm.act("UPDATE_TABLE",
             request_pending_clr.eq(1),
-            update.eq(1),
-            NextState("CHECK_TABLE")
-        )
-        self.sync += \
-            If(update,
-                cached_valid.eq(1),
-                cached_ip_address.eq(sink.ip_address),
-                cached_mac_address.eq(sink.mac_address),
-            ).Else(
-                If(cached_timer.done,
-                    cached_valid.eq(0)
-                )
+            hash_table.insert_request.eq(1),
+            hash_table.lookup_request.eq(0),
+            hash_table.operation_ip.eq(rx_mac_address),
+            hash_table.insert_mac.eq(rx_ip_address),
+            If(hash_table.operation_done,
+                NextState("CHECK_TABLE")
             )
-        self.comb += cached_timer.wait.eq(~update)
+        )
+
         fsm.act("CHECK_TABLE",
+            hash_table.insert_request.eq(0),
+            hash_table.lookup_request.eq(1),
+            hash_table.operation_ip.eq(request_ip_address),
+            If(hash_table.operation_done & hash_table.lookup_found,
+                request_ip_address_reset.eq(1),
+                NextState("PRESENT_RESPONSE"),
+            )
+            .Elif(hash_table.operation_done,
+                NextState("PRESENT_RESPONSE"),
+            )
+
             If(cached_valid,
                 If(request_ip_address == cached_ip_address,
                     request_ip_address_reset.eq(1),
