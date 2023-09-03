@@ -90,13 +90,7 @@ class LiteEthPHYRGMIITX(LiteXModule):
                 valid.eq(sink.valid)
             )
 
-            self.sync += If(linkstate.link_1G,
-                ready.eq(1),
-            ).Elif(clk_en,
-                ready.eq(ready_next)
-            ).Else(
-                ready.eq(0)
-            )
+            self.sync += ready.eq(linkstate.link_1G | (clk_en & ready_next))
 
             self.sync += If(linkstate.link_1G,
                 nibble_select.eq(0)
