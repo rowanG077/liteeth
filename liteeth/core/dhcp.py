@@ -713,6 +713,37 @@ class LiteEthDHCPRX(LiteXModule):
         )
 
 # DHCP ---------------------------------------------------------------------------------------------
+class DHCPLeaseTimer(LiteXModule):
+    def __init__(self, sys_clk_freq):
+        self.load_lease = Signal()   # i
+        self.lease_time = Signal(32) # i
+        self.expired    = Signal()   # o
+
+        # we run with .5% shorter seconds to ensure expiry
+        # is always triggered before the real expiry
+        sec_adjusted    = int(sys_clk_freq - 0.005 * sys_clk_freq)
+        sec_counter     = Signal(max=sec_adjusted)
+        prev_msb        = Signal()
+        tick            = Signal()
+
+        self.sync += [
+            sec_counter.eq(sec_counter - 1),
+            prev_msb.eq(sec_counter[-1])
+        ]
+        self.comb += tick.eq(prev_msb & ~sec_counter[-1])
+
+        # We support a leasetime of max ~68 years
+        # We can ignore the MSB of the leasetime this way
+        # and use it to trigger expiry
+        lease_time = Signal(32, reset=2**31-1)
+
+        self.sync += If(self.load_lease,
+            lease_time.eq(Cat(self.lease_time[0:31], 0))
+        ).Elif(tick,
+            lease_time.eq(lease_time - 1)
+        )
+
+        self.comb += self.expired.eq(lease_time[-1])
 
 class LiteEthDHCP(LiteXModule):
     def __init__(self, udp_port, sys_clk_freq, timeout=1e0):
@@ -757,12 +788,15 @@ class LiteEthDHCP(LiteXModule):
             self.timeout.eq(timeout_timer.done),
         ]
 
+        # DHCP lease timer
+        self.lease_timer = lease_timer = DHCPLeaseTimer(sys_clk_freq)
+
         # DHCP FSM.
         self.fsm = fsm = ResetInserter()(FSM(reset_state="IDLE"))
         self.comb += fsm.reset.eq(self.timeout)
         fsm.act("IDLE",
             self.done.eq(1),
-            If(self.start,
+            If(self.start | lease_timer.expired,
                 NextValue(transaction_id, transaction_id + 1),
                 NextState("SEND-DISCOVER")
             )
@@ -794,6 +828,8 @@ class LiteEthDHCP(LiteXModule):
         fsm.act("RECEIVE-ACK",
             rx.capture.eq(1),
             If(rx.present & ~rx.error & (rx.type == DHCP_RX_ACK),
+                lease_timer.load_lease.eq(1),
+                lease_timer.lease_time.eq(rx.lease_time),
                 NextValue(self.ip_address, offered_ip_address),
                 NextState("IDLE")
             )
