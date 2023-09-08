@@ -32,9 +32,9 @@ DHCP_SERVER_PORT = 67
 DHCP_CLIENT_PORT = 68
 
 DHCP_MAX_PACKET_LENGTH     = 574
-DHCP_FIXED_HEADER_LENGTH   = 236
-DHCP_FIXED_DISCOVER_LENGTH = DHCP_FIXED_HEADER_LENGTH + 20
-DHCP_FIXED_REQUEST_LENGTH  = DHCP_FIXED_HEADER_LENGTH + 32
+DHCP_FIXED_HEADER_LENGTH   = 240
+DHCP_FIXED_DISCOVER_LENGTH = DHCP_FIXED_HEADER_LENGTH + 16
+DHCP_FIXED_REQUEST_LENGTH  = DHCP_FIXED_HEADER_LENGTH + 28
 DHCP_SERVER_NAME_LENGTH    = 64
 DHCP_BOOT_FILE_NAME_LENGTH = 128
 
@@ -388,18 +388,17 @@ class LiteEthDHCPOptEngine(LiteXModule):
         # The gateway, subnet and lease_time are resetless
         # This is done because when Idling you don't
         # want to lose the old state
-        self.type              = Signal(reset_less=True)
+        self.type              = Signal()
         self.gateway           = Signal(32, reset_less=True)
         self.subnet_mask       = Signal(32, reset_less=True)
         self.lease_time        = Signal(32, reset_less=True)
-        type_valid             = Signal(reset_less=True)
-        gateway_valid          = Signal(reset_less=True)
-        subnet_mask_valid      = Signal(reset_less=True)
-        lease_time_valid       = Signal(reset_less=True)
+        type_valid             = Signal()
+        gateway_valid          = Signal()
+        subnet_mask_valid      = Signal()
+        lease_time_valid       = Signal()
 
-        # magic cookie is 4 bytes
         # this ensure we can hold the entire DHCP Options in FIFO
-        fifo_depth     = (DHCP_MAX_PACKET_LENGTH - DHCP_FIXED_HEADER_LENGTH - 4) // 4
+        fifo_depth     = (DHCP_MAX_PACKET_LENGTH - DHCP_FIXED_HEADER_LENGTH) // 4
         self.fifo      = fifo      = stream.SyncFIFO(eth_dhcp_opt_description(32), depth=fifo_depth, buffered=True)
         self.down_conv = down_conv = LiteEthDHCPOptDownConverter()
 
@@ -417,8 +416,8 @@ class LiteEthDHCPOptEngine(LiteXModule):
         self.comb += down_conv.source.ready.eq(1)
         byte_stream = down_conv.source
 
-        found_last    = Signal()
-        found_end     = Signal()
+        self.found_last = found_last = Signal()
+        self.found_end =  found_end  = Signal()
 
         current_opt   = Signal(3)
         payload       = Signal(32)
@@ -541,147 +540,176 @@ class LiteEthDHCPRX(LiteXModule):
 
         do_present = Signal()
 
+        self.dbg = Signal(8)
+
         # Common FSM.
         # -----------
         self.fsm = fsm = FSM(reset_state="IDLE")
         fsm.act("IDLE",
+            NextValue(self.dbg, 1),
             NextValue(self.error, 0),
-            NextValue(self.present, 0),
             NextValue(opt_engine.reset, 1),
-            udp_port.source.ready.eq(1),
+            udp_port.source.ready.eq(0),
+
             If(udp_port.source.valid,
+                NextValue(self.dbg, 2),
                 # If capture is not set we are not waiting for a response
                 If(self.capture & (udp_port.source.dst_port == DHCP_CLIENT_PORT) &
                    (udp_port.source.src_port == DHCP_SERVER_PORT) &
-                   # Fixed header + magic_cookie + message_type.
-                   (udp_port.source.length > DHCP_FIXED_HEADER_LENGTH + 4 + 4),
-                    udp_port.source.ready.eq(0),
-                    NextState("HEADER")
+                   # Fixed header + message_type.
+                   (udp_port.source.length > DHCP_FIXED_HEADER_LENGTH + 4),
+                    NextValue(self.dbg, 3),
+                    NextState("HEADER"),
                 ).Else(
+                    NextValue(self.dbg, 4),
                     NextValue(do_present, 0),
-                    NextState("DROP")
+                    NextState("DROP"),
                 )
             )
         )
         fsm.act("HEADER",
+            NextValue(self.dbg, 10),
             NextValue(opt_engine.reset, 0),
             # FIXME: Add Check?
             udp_port.source.ready.eq(1),
             If(udp_port.source.valid,
-                NextState("TRANSACTION-ID")
+                NextValue(self.dbg, 11),
+                NextState("TRANSACTION-ID"),
             )
         )
         fsm.act("TRANSACTION-ID",
+            NextValue(self.dbg, 20),
             udp_port.source.ready.eq(1),
             If(udp_port.source.valid,
                 If(udp_port.source.data == self.transaction_id,
-                    NextState("SECONDS-FLAGS")
+                    NextValue(self.dbg, 21),
+                    NextState("SECONDS-FLAGS"),
                 ).Else(
+                    NextValue(self.dbg, 22),
                     NextValue(do_present, 0),
-                    NextState("DROP")
+                    NextState("DROP"),
                 )
             )
         )
         fsm.act("SECONDS-FLAGS",
+            NextValue(self.dbg, 30),
             # FIXME: Add Check?
             udp_port.source.ready.eq(1),
             If(udp_port.source.valid,
-                NextState("CLIENT-IP-ADDRESS")
+                NextValue(self.dbg, 31),
+                NextState("CLIENT-IP-ADDRESS"),
             )
         )
         fsm.act("CLIENT-IP-ADDRESS",
+            NextValue(self.dbg, 40),
             # FIXME: Add Check?
             udp_port.source.ready.eq(1),
             If(udp_port.source.valid,
-                NextState("YOUR-IP-ADDRESS")
+                NextValue(self.dbg, 41),
+                NextState("YOUR-IP-ADDRESS"),
             )
         )
         fsm.act("YOUR-IP-ADDRESS",
+            NextValue(self.dbg, 50),
             udp_port.source.ready.eq(1),
             If(udp_port.source.valid,
+                NextValue(self.dbg, 51),
                 NextValue(self.offered_ip_address[24:32], udp_port.source.data[ 0: 8]),
                 NextValue(self.offered_ip_address[16:24], udp_port.source.data[ 8:16]),
                 NextValue(self.offered_ip_address[ 8:16], udp_port.source.data[16:24]),
                 NextValue(self.offered_ip_address[ 0: 8], udp_port.source.data[24:32]),
-                NextState("SERVER-IP-ADDRESS")
+                NextState("SERVER-IP-ADDRESS"),
             ),
         )
         fsm.act("SERVER-IP-ADDRESS",
+            NextValue(self.dbg, 60),
             udp_port.source.ready.eq(1),
             If(udp_port.source.valid,
+                NextValue(self.dbg, 61),
                 NextValue(self.server_ip_address[24:32], udp_port.source.data[ 0: 8]),
                 NextValue(self.server_ip_address[16:24], udp_port.source.data[ 8:16]),
                 NextValue(self.server_ip_address[ 8:16], udp_port.source.data[16:24]),
                 NextValue(self.server_ip_address[ 0: 8], udp_port.source.data[24:32]),
-                NextState("GATEWAY-IP-ADDRESS")
+                NextState("GATEWAY-IP-ADDRESS"),
             )
         )
         fsm.act("GATEWAY-IP-ADDRESS",
+            NextValue(self.dbg, 70),
             # FIXME: Add Check?
             udp_port.source.ready.eq(1),
             If(udp_port.source.valid,
-                NextState("CLIENT-MAC-ADDRESS-MSB")
+                NextValue(self.dbg, 71),
+                NextState("CLIENT-MAC-ADDRESS-MSB"),
             )
         )
         fsm.act("CLIENT-MAC-ADDRESS-MSB", # Client MAC address MSBs.
             udp_port.source.ready.eq(1),
+            NextValue(self.dbg, 80),
             If(udp_port.source.valid,
                 If((udp_port.source.data[ 0: 8] == self.mac_address[40:48]) &
                    (udp_port.source.data[ 8:16] == self.mac_address[32:40]) &
                    (udp_port.source.data[16:24] == self.mac_address[24:32]) &
                    (udp_port.source.data[24:32] == self.mac_address[16:24]),
+                    NextValue(self.dbg, 81),
                     NextState("CLIENT-MAC-ADDRESS-LSB"),
                 ).Else(
+                    NextValue(self.dbg, 82),
                     NextValue(do_present, 0),
-                    NextState("DROP")
+                    NextState("DROP"),
                 )
             )
         )
         fsm.act("CLIENT-MAC-ADDRESS-LSB", # Client MAC address LSBs.
             udp_port.source.ready.eq(1),
+            NextValue(self.dbg, 90),
+
             If(udp_port.source.valid,
                 If((udp_port.source.data[ 0: 8] == self.mac_address[ 8:16]) &
                    (udp_port.source.data[ 8:16] == self.mac_address[ 0: 8]),
+                    NextValue(self.dbg, 91),
                     NextState("MAGIC-COOKIE"),
                 ).Else(
+                    NextValue(self.dbg, 92),
                     NextValue(do_present, 0),
-                    NextState("DROP")
+                    NextState("DROP"),
                 )
             )
         )
         fsm.act("MAGIC-COOKIE",
+            NextValue(self.dbg, 100),
             udp_port.source.ready.eq(1),
             If(udp_port.source.valid,
                 If((udp_port.source.data[ 0: 8] == 0x63) &
                    (udp_port.source.data[ 8:16] == 0x82) &
                    (udp_port.source.data[16:24] == 0x53) &
                    (udp_port.source.data[24:32] == 0x63),
-                   NextState("OPTIONS")
-                ).Else(
-                    NextValue(do_present, 1),
-                    NextValue(self.error, 0),
-                    NextState("DROP")
+                   NextState("OPTIONS"),
+                   NextValue(self.dbg, 101),
                 )
             )
         )
         fsm.act("OPTIONS",
             udp_port.source.connect(opt_engine.sink),
             udp_port.source.ready.eq(1),
+            NextValue(self.dbg, 110),
             If(udp_port.source.valid,
                 # Drop the packet if OPTIONS engine cannot accept more
                 # Any well formed DHCP packet should never overflow OPTIONS engine
                 If(~opt_engine.sink.ready,
                     If(udp_port.source.last,
-                        NextValue(self.present, 1),
+                        self.present.eq(1),
                         NextValue(self.error, 0),
-                        NextState("IDLE")
+                        NextState("IDLE"),
+                        NextValue(self.dbg, 111),
                     ).Else(
                         NextValue(do_present, 1),
                         NextValue(self.error, 0),
-                        NextState("DROP")
+                        NextState("DROP"),
+                        NextValue(self.dbg, 112),
                     )
                 ).Elif(udp_port.source.last,
                     NextState("AWAIT-OPT-ENGINE"),
+                    NextValue(self.dbg, 113),
                 )
             )
         )
@@ -690,6 +718,7 @@ class LiteEthDHCPRX(LiteXModule):
         prev_drop = Signal()
         drop = Signal()
         fsm.act("AWAIT-OPT-ENGINE",
+            NextValue(self.dbg, 120),
             udp_port.source.ready.eq(1),
             drop.eq(~(udp_port.source.valid & udp_port.source.last) & (prev_drop | udp_port.source.valid)),
             NextValue(prev_drop, drop),
@@ -697,18 +726,22 @@ class LiteEthDHCPRX(LiteXModule):
                 NextValue(self.error, 0),
                 If(drop,
                     NextValue(do_present, 1),
-                    NextState("DROP")
+                    NextState("DROP"),
+                    NextValue(self.dbg, 121),
                 ).Else(
-                    NextValue(self.present, 1),
-                    NextState("IDLE")
+                    self.present.eq(1),
+                    NextState("IDLE"),
+                    NextValue(self.dbg, 122),
                 )
             )
         )
         fsm.act("DROP",
+            NextValue(self.dbg, 130),
             udp_port.source.ready.eq(1),
             If(udp_port.source.valid & udp_port.source.last,
-                NextValue(self.present, do_present),
-                NextState("IDLE")
+                self.present.eq(do_present),
+                NextState("IDLE"),
+                NextValue(self.dbg, 131),
             )
         )
 
@@ -719,9 +752,9 @@ class DHCPLeaseTimer(LiteXModule):
         self.lease_time = Signal(32) # i
         self.expired    = Signal()   # o
 
-        # we run with .5% shorter seconds to ensure expiry
+        # we run with 2% shorter seconds to ensure expiry
         # is always triggered before the real expiry
-        sec_adjusted    = int(sys_clk_freq - 0.005 * sys_clk_freq)
+        sec_adjusted    = int(sys_clk_freq - 0.02 * sys_clk_freq)
         sec_counter     = Signal(max=sec_adjusted)
         prev_msb        = Signal()
         tick            = Signal()
@@ -748,6 +781,8 @@ class DHCPLeaseTimer(LiteXModule):
 class LiteEthDHCP(LiteXModule):
     def __init__(self, udp_port, sys_clk_freq, timeout=1e0):
         assert len(udp_port.sink.data) == 32 # Only supports 32-bit UDP port.
+
+        self.udp_port = udp_port
 
         # Control/Status.
         self.start   = Signal() # i
