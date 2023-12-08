@@ -1,0 +1,16 @@
+--- # PHY ----------------------------------------------------------------------
+# Copyright (c) 2023 LumiGuide Fietsdetectie B.V. <goemansrowan@gmail.com>
+# License: BSD
+
+phy: LiteEthECP5PHYRGMII
+phy_tx_delay: 0e-9
+phy_rx_delay: 2e-9
+device: LFE5UM5G-85F-8BG381C
+vendor: lattice
+toolchain: trellis
+# Core -------------------------------------------------------------------------
+clk_freq: 125e6
+endianness: big
+core: mac_raw
+# Send IP packets
+ethertype: 0x0800

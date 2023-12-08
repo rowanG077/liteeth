@@ -209,6 +209,31 @@ def get_udp_raw_port_ios(name, data_width):
         ),
     ]
 
+def get_mac_raw_port_ios(name, data_width):
+    return [
+        (f"{name}", 0,
+
+            # Sink.
+            Subsignal("sink_target_mac", Pins(48)),
+            Subsignal("sink_sender_mac", Pins(48)),
+            Subsignal("sink_valid",      Pins(1)),
+            Subsignal("sink_last",       Pins(1)),
+            Subsignal("sink_ready",      Pins(1)),
+            Subsignal("sink_data",       Pins(data_width)),
+            Subsignal("sink_last_be",    Pins(data_width//8)),
+            Subsignal("sink_error",      Pins(data_width//8)),
+
+            # Source.
+            Subsignal("source_target_mac", Pins(48)),
+            Subsignal("source_sender_mac", Pins(48)),
+            Subsignal("source_valid",      Pins(1)),
+            Subsignal("source_last",       Pins(1)),
+            Subsignal("source_ready",      Pins(1)),
+            Subsignal("source_data",       Pins(data_width)),
+            Subsignal("source_last_be",    Pins(data_width//8)),
+            Subsignal("source_error",      Pins(1)),
+        ),
+    ]
 
 # PHY Core -----------------------------------------------------------------------------------------
 
@@ -318,6 +343,7 @@ class PHYCore(SoCMini):
 class MACCore(PHYCore):
     def __init__(self, platform, core_config):
         # Parameters -------------------------------------------------------------------------------
+        data_width      = core_config.get("data_width", 8)
         nrxslots        = core_config.get("nrxslots", 2)
         ntxslots        = core_config.get("ntxslots", 2)
         bus_standard    = core_config["core"]
@@ -325,47 +351,107 @@ class MACCore(PHYCore):
         tx_cdc_buffered = core_config.get("tx_cdc_buffered", False)
         rx_cdc_depth    = core_config.get("rx_cdc_depth", 32)
         rx_cdc_buffered = core_config.get("rx_cdc_buffered", False)
-        assert bus_standard in ["wishbone", "axi-lite"]
+        assert bus_standard in ["wishbone", "axi-lite", "mac_raw"]
 
         # PHY --------------------------------------------------------------------------------------
         PHYCore.__init__(self, platform, core_config)
 
         # MAC --------------------------------------------------------------------------------------
-        self.ethmac = ethmac = LiteEthMAC(
-            phy             = self.ethphy,
-            dw              = 32,
-            interface       = "wishbone",
-            endianness      = core_config["endianness"],
-            nrxslots        = nrxslots,
-            ntxslots        = ntxslots,
-            full_memory_we  = core_config.get("full_memory_we", False),
-            tx_cdc_depth    = tx_cdc_depth,
-            tx_cdc_buffered = tx_cdc_buffered,
-            rx_cdc_depth    = rx_cdc_depth,
-            rx_cdc_buffered = rx_cdc_buffered,
-        )
+        if bus_standard in ["wishbone", "axi-lite"]:
+            self.ethmac = ethmac = LiteEthMAC(
+                phy             = self.ethphy,
+                dw              = 32,
+                interface       = "wishbone",
+                endianness      = core_config["endianness"],
+                nrxslots        = nrxslots,
+                ntxslots        = ntxslots,
+                full_memory_we  = core_config.get("full_memory_we", False),
+                tx_cdc_depth    = tx_cdc_depth,
+                tx_cdc_buffered = tx_cdc_buffered,
+                rx_cdc_depth    = rx_cdc_depth,
+                rx_cdc_buffered = rx_cdc_buffered,
+            )
+
+        if bus_standard == "mac_raw":
+            platform.add_extension(get_mac_raw_port_ios("mac_raw",
+                data_width     = data_width
+            ))
+
+            port_ios = platform.request("mac_raw")
+
+            # MAC Address.
+            mac_address = core_config.get("mac_address", None)
+            # Get MAC Address from IOs when not specified.
+            if mac_address is None:
+                mac_address = platform.request("mac_address")
+
+            # ethertype
+            ethertype = core_config.get("ethertype", None)
+            assert (ethertype != None)
+
+            self.ethmac = LiteEthMAC(
+                phy               = self.ethphy,
+                dw                = data_width,
+                endianness        = core_config["endianness"],
+                hw_mac            = mac_address,
+                with_preamble_crc = True,
+                with_sys_datapath = (data_width == 32),
+                tx_cdc_depth      = tx_cdc_depth,
+                tx_cdc_buffered   = tx_cdc_buffered,
+                rx_cdc_depth      = rx_cdc_depth,
+                rx_cdc_buffered   = rx_cdc_buffered
+            )
+
+            mac_port = self.ethmac.crossbar.get_port(ethertype, data_width)
+
+            # connect sink IO
+            self.comb += [
+                mac_port.sink.target_mac.eq(port_ios.sink_target_mac),
+                mac_port.sink.sender_mac.eq(port_ios.sink_sender_mac),
+                mac_port.sink.valid.eq(port_ios.sink_valid),
+                mac_port.sink.last.eq(port_ios.sink_last),
+                port_ios.sink_ready.eq(mac_port.sink.ready),
+                mac_port.sink.data.eq(port_ios.sink_data),
+                mac_port.sink.last_be.eq(port_ios.sink_last_be),
+                mac_port.sink.error.eq(port_ios.sink_error)
+            ]
+
+            # connect source IO
+            self.comb += [
+                port_ios.source_target_mac.eq(mac_port.source.target_mac),
+                port_ios.source_sender_mac.eq(mac_port.source.sender_mac),
+                port_ios.source_valid.eq(mac_port.source.valid),
+                port_ios.source_last.eq(mac_port.source.last),
+                mac_port.source.ready.eq(port_ios.source_ready),
+                port_ios.source_data.eq(mac_port.source.data),
+                port_ios.source_last_be.eq(mac_port.source.last_be),
+                port_ios.source_error.eq(mac_port.source.error)
+            ]
+
+
 
         if bus_standard == "wishbone":
-          # Wishbone Interface -----------------------------------------------------------------------
-          wb_bus = wishbone.Interface()
-          platform.add_extension(wb_bus.get_ios("wishbone"))
-          self.comb += wb_bus.connect_to_pads(self.platform.request("wishbone"), mode="slave")
-          self.bus.add_master(master=wb_bus)
+            # Wishbone Interface -----------------------------------------------------------------------
+            wb_bus = wishbone.Interface()
+            platform.add_extension(wb_bus.get_ios("wishbone"))
+            self.comb += wb_bus.connect_to_pads(self.platform.request("wishbone"), mode="slave")
+            self.bus.add_master(master=wb_bus)
 
         if bus_standard == "axi-lite":
-          # AXI-Lite Interface -----------------------------------------------------------------------
-          axil_bus = axi.AXILiteInterface(address_width=32, data_width=32)
-          platform.add_extension(axil_bus.get_ios("bus"))
-          self.submodules += axi.Wishbone2AXILite(ethmac.bus, axil_bus)
-          self.comb += axil_bus.connect_to_pads(self.platform.request("bus"), mode="slave")
-          self.bus.add_master(master=axil_bus)
+            # AXI-Lite Interface -----------------------------------------------------------------------
+            axil_bus = axi.AXILiteInterface(address_width=32, data_width=32)
+            platform.add_extension(axil_bus.get_ios("bus"))
+            self.submodules += axi.Wishbone2AXILite(ethmac.bus, axil_bus)
+            self.comb += axil_bus.connect_to_pads(self.platform.request("bus"), mode="slave")
+            self.bus.add_master(master=axil_bus)
 
-        ethmac_region_size = (nrxslots + ntxslots)*buffer_depth
-        ethmac_region = SoCRegion(origin=self.mem_map.get("ethmac", None), size=ethmac_region_size, cached=False)
-        self.bus.add_slave(name="ethmac", slave=ethmac.bus, region=ethmac_region)
+        if bus_standard in ["wishbone", "axi-lite"]:
+            ethmac_region_size = (nrxslots + ntxslots)*buffer_depth
+            ethmac_region = SoCRegion(origin=self.mem_map.get("ethmac", None), size=ethmac_region_size, cached=False)
+            self.bus.add_slave(name="ethmac", slave=ethmac.bus, region=ethmac_region)
 
-        # Interrupt Interface ----------------------------------------------------------------------
-        self.comb += self.platform.request("interrupt").eq(self.ethmac.ev.irq)
+            # Interrupt Interface ----------------------------------------------------------------------
+            self.comb += self.platform.request("interrupt").eq(self.ethmac.ev.irq)
 
 # UDP Core -----------------------------------------------------------------------------------------
 
@@ -593,7 +679,7 @@ def main():
         raise ValueError("Unsupported vendor: {}".format(core_config["vendor"]))
     platform.add_extension(_io)
 
-    if core_config["core"] in ["wishbone", "axi-lite"]:
+    if core_config["core"] in ["wishbone", "axi-lite", "mac_raw"]:
         soc = MACCore(platform, core_config)
     elif core_config["core"] == "udp":
         soc = UDPCore(platform, core_config)
