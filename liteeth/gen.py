@@ -379,12 +379,6 @@ class MACCore(PHYCore):
 
             port_ios = platform.request("mac_raw")
 
-            # MAC Address.
-            mac_address = core_config.get("mac_address", None)
-            # Get MAC Address from IOs when not specified.
-            if mac_address is None:
-                mac_address = platform.request("mac_address")
-
             # ethertype
             ethertype = core_config.get("ethertype", None)
             assert (ethertype != None)
@@ -393,7 +387,6 @@ class MACCore(PHYCore):
                 phy               = self.ethphy,
                 dw                = data_width,
                 endianness        = core_config["endianness"],
-                hw_mac            = mac_address,
                 with_preamble_crc = True,
                 with_sys_datapath = (data_width == 32),
                 tx_cdc_depth      = tx_cdc_depth,
