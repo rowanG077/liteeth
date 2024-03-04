@@ -833,7 +833,7 @@ class LiteEthDHCP(LiteXModule):
         # Expire the lease 30 seconds before the real expiration
         # an expired IP is never used.
         self.sync += If(lease_load,
-            lease_time.eq(rx.lease_time - 31),
+            lease_time.eq(rx.lease_time - rx.lease_time[3:]),
         ).Elif(sec_tick & ~lease_expired,
             lease_time.eq(lease_time - 1)
         )
